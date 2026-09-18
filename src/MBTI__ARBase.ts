@@ -750,6 +750,19 @@ export class Model implements IModel {
             ? by
             : ["id"];
 
+        const applyDataOptions: ApplyDataOptions = options?.relations
+            ? {
+                relationMode: "spec",
+                relationSpec: options.relations as Record<string, any>,
+            }
+            : { relationMode: "none" };
+
+        const queryOptions = {
+            ...(options?.withSoftDeleted !== undefined ? { withSoftDeleted: options.withSoftDeleted } : {}),
+            ...(options?.onlySoftDeleted !== undefined ? { onlySoftDeleted: options.onlySoftDeleted } : {}),
+            ...(options?.forUpdate !== undefined ? { forUpdate: options.forUpdate } : {}),
+        };
+
         const scopeDefaults: Record<string, any> = {};
 
         for (const [key, value] of Object.entries((where ?? {}) as Record<string, any>)) {
@@ -776,15 +789,38 @@ export class Model implements IModel {
             return next as ModelMutationData<T>;
         };
 
+        const resolveCompareValue = (value: any): any => {
+            if (!isUsable(value)) return null;
+
+            if (value instanceof Date) return value;
+
+            if (typeof value === "object" && !Array.isArray(value)) {
+                if (isUsable(value.id)) return value.id;
+                return null;
+            }
+
+            return value;
+        };
+
+        const normalizeCompareValue = (value: any): string | null => {
+            const resolved = resolveCompareValue(value);
+
+            if (!isUsable(resolved)) return null;
+
+            if (resolved instanceof Date) return resolved.toISOString();
+
+            return String(resolved);
+        };
+
         const buildKey = (source: any): string | null => {
             const parts: string[] = [];
 
             for (const key of compareKeys) {
-                const value = source?.[key];
+                const normalized = normalizeCompareValue(source?.[key]);
 
-                if (!isUsable(value)) return null;
+                if (!normalized) return null;
 
-                parts.push(`${key}:${String(value)}`);
+                parts.push(`${key}:${normalized}`);
             }
 
             return parts.join("|");
@@ -795,7 +831,7 @@ export class Model implements IModel {
             const payloadRecord = payload as Record<string, any>;
 
             for (const key of compareKeys) {
-                const value = payloadRecord[key];
+                const value = resolveCompareValue(payloadRecord[key]);
 
                 if (!isUsable(value)) return null;
 
@@ -803,6 +839,14 @@ export class Model implements IModel {
             }
 
             return filters;
+        };
+
+        const mergeWhereWithKeys = (filters: Record<string, any>): WhereCondition<T> => {
+            if (!where || Object.keys(where as object).length === 0) {
+                return filters as WhereCondition<T>;
+            }
+
+            return { AND: [where, filters as WhereCondition<T>] } as WhereCondition<T>;
         };
 
         const validRecords = records
@@ -821,9 +865,16 @@ export class Model implements IModel {
             payloadByKey.set(key, record);
         }
 
+        const canDeleteMissing = !!options?.deleteMissing && payloadByKey.size > 0;
+        const isOneToOneUnkeyedUpdate =
+            validRecords.length === 1 &&
+            payloadByKey.size === 0 &&
+            buildKey(validRecords[0]) === null;
+
         const touchedKeys = new Set<string>();
         const rowsToDelete: T[] = [];
         const result: T[] = [];
+        let singleExistingRow: T | null = null;
 
         const totalExisting = this.count(where, {
             ...(options?.withSoftDeleted !== undefined ? { withSoftDeleted: options.withSoftDeleted } : {}),
@@ -833,9 +884,7 @@ export class Model implements IModel {
         for (let offset = 0; offset < totalExisting; offset += SYNC_PAGE_SIZE) {
             const existingPage = this.find({
                 where,
-                ...(options?.withSoftDeleted !== undefined ? { withSoftDeleted: options.withSoftDeleted } : {}),
-                ...(options?.onlySoftDeleted !== undefined ? { onlySoftDeleted: options.onlySoftDeleted } : {}),
-                ...(options?.forUpdate !== undefined ? { forUpdate: options.forUpdate } : {}),
+                ...queryOptions,
                 orderBy: [{ field: "createdAt", order: "DESC" }],
                 limit: SYNC_PAGE_SIZE,
                 offset,
@@ -844,6 +893,10 @@ export class Model implements IModel {
             if (existingPage.length === 0) break;
 
             for (const row of existingPage) {
+                if (isOneToOneUnkeyedUpdate && totalExisting === 1) {
+                    singleExistingRow = row;
+                }
+
                 const rowKey = buildKey(row);
 
                 if (!rowKey) continue;
@@ -851,13 +904,13 @@ export class Model implements IModel {
                 const payload = payloadByKey.get(rowKey);
 
                 if (!payload) {
-                    if (options?.deleteMissing) {
+                    if (canDeleteMissing) {
                         rowsToDelete.push(row);
                     }
                     continue;
                 }
 
-                Model._applyData(row, payload);
+                Model._applyData(row, payload, applyDataOptions);
                 row.save(options);
                 touchedKeys.add(rowKey);
                 result.push(row);
@@ -872,6 +925,14 @@ export class Model implements IModel {
             const payloadKey = buildKey(record);
 
             if (!payloadKey) {
+                if (singleExistingRow) {
+                    Model._applyData(singleExistingRow, record, applyDataOptions);
+                    singleExistingRow.save(options);
+                    result.push(singleExistingRow);
+                    singleExistingRow = null;
+                    continue;
+                }
+
                 const created = this.create(record, options);
                 result.push(created);
                 continue;
@@ -881,22 +942,17 @@ export class Model implements IModel {
                 continue;
             }
 
-            if (compareKeys[0] !== "id") {
-                const payloadWhere = buildWhereForPayload(record);
+            const payloadWhere = buildWhereForPayload(record);
 
-                if (payloadWhere) {
-                    const existingRow = this.findOne(payloadWhere, {
-                        ...(options?.withSoftDeleted !== undefined ? { withSoftDeleted: options.withSoftDeleted } : {}),
-                        ...(options?.onlySoftDeleted !== undefined ? { onlySoftDeleted: options.onlySoftDeleted } : {}),
-                        ...(options?.forUpdate !== undefined ? { forUpdate: options.forUpdate } : {}),
-                    });
+            if (payloadWhere) {
+                const existingRow = this.findOne(mergeWhereWithKeys(payloadWhere), queryOptions);
 
-                    if (existingRow) {
-                        Model._applyData(existingRow, record);
-                        existingRow.save(options);
-                        result.push(existingRow);
-                        continue;
-                    }
+                if (existingRow) {
+                    Model._applyData(existingRow, record, applyDataOptions);
+                    existingRow.save(options);
+                    touchedKeys.add(payloadKey);
+                    result.push(existingRow);
+                    continue;
                 }
             }
 

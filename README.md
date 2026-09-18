@@ -6,7 +6,7 @@ This ORM is designed for AppCube runtime (`db`, `context`) with Active Record st
 
 - Use `Model.create(data, options)` for normal inserts.
 - Use `Model.update(idOrWhere, data, options)` for normal single-row updates.
-- Use `Model.sync(where, records, options)` for upsert-like list synchronization.
+- Use `Model.sync(where, records, options)` to upsert a list; pass `deleteMissing: true` only to replace the whole `where` collection.
 - Use `new Model() + save()` only when you need custom staged mutation before saving.
 - Keep transaction boundaries in service layer for multi-table workflows.
 
@@ -49,10 +49,33 @@ const payment = PackageReservationPayment.update(
 - `update(...)` is scalar-only by default; relation fields are ignored unless they are explicitly included via `options.relations`.
 - Unchanged values are skipped to reduce no-op writes.
 
-### Sync (create/update/delete-missing)
+### Sync (upsert)
+
+Default matching is `id`. Update payloads without `id` will not match existing rows — they are created. Use `syncBy` with business keys when you need to update without `id`.
 
 ```ts
+// Update matching rows / create the rest. Other benefits for this package are left alone.
 const synced = PackageBenefit.sync(
+  { packageId },
+  [
+    { id: "existing-id-1", amenityId: "A1", name: { en_US: "Spa", my_MM: "Spa", zh_CN: "Spa" } },
+    { amenityId: "A2", name: { en_US: "Breakfast", my_MM: "Breakfast", zh_CN: "Breakfast" } },
+  ],
+  { forUpdate: true }
+);
+```
+
+- Existing rows in `where` with matching `id` are updated.
+- Rows without `id` are created.
+- Other rows in `where` are not deleted.
+- Like `update(...)`, relation fields are ignored unless `options.relations` is set.
+
+### Replace a collection (`deleteMissing`)
+
+Pass the **full** desired list. Existing rows in `where` whose compare key is not in the payload are deleted.
+
+```ts
+const replaced = PackageBenefit.sync(
   { packageId },
   [
     { id: "existing-id-1", amenityId: "A1", name: { en_US: "Spa", my_MM: "Spa", zh_CN: "Spa" } },
@@ -65,15 +88,23 @@ const synced = PackageBenefit.sync(
 );
 ```
 
-- Existing rows in `where` with matching `id` are updated.
-- Rows without `id` are created.
-- Existing rows not present in input are deleted only when `deleteMissing: true`.
+- Omit `deleteMissing` for single-item / partial upserts; otherwise siblings in `where` are removed.
+- `deleteMissing` is ignored if none of the payload rows have usable compare keys (for default `id`, that means no ids). This prevents wiping the scope when updating without keys.
 
 ### Sync By custom keys
 
 ```ts
 // Default key is ["id"].
 // For pivot tables, use composite keys.
+
+// Upsert one/some pivots — other categories for this package are kept.
+PackageCategories.syncBy(
+  { packageId: pkg.id },
+  [{ packageId: pkg.id, categoryId }],
+  ["packageId", "categoryId"]
+);
+
+// Replace the whole collection for this package.
 PackageCategories.syncBy(
   { packageId: pkg.id },
   payload.categoryIds.map(categoryId => ({ packageId: pkg.id, categoryId })),
@@ -83,7 +114,8 @@ PackageCategories.syncBy(
 ```
 
 - `sync(...)` is shorthand for `syncBy(..., ["id"])`.
-- If custom `by` is passed, rows are matched by those keys.
+- If custom `by` is passed, rows are matched by those keys (not `id`).
+- Updates without `id` must use `syncBy` with those keys, otherwise old rows cannot be matched.
 
 ## Column Defaults
 
