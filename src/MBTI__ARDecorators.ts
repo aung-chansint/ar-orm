@@ -37,6 +37,8 @@ export interface ColumnMeta {
     readOnly?: boolean;
     allowedValues?: string[];
     languages?: string[];
+    default?: any | (() => any);
+    expose?: boolean;
     system?: SystemColumnType;
 }
 
@@ -53,6 +55,8 @@ export interface ColumnOptions {
     readOnly?: boolean;
     allowedValues?: string[];
     languages?: string[];
+    default?: any | (() => any);
+    expose?: boolean;
 }
 
 export type RelationType =
@@ -61,17 +65,19 @@ export type RelationType =
     | "OneToOne"
     | "ManyToMany";
 
-export type CascadeType = "master" | "detail" | "lookup";
+export type CascadeType = "master" | "lookup";
+export type OneToOneOwner = "self" | "target";
 
 export interface RelationMeta {
     propertyName: string;
     type: RelationType;
     target: () => Function;
     foreignKey?: string;
-    cascadeType?: CascadeType;
+    cascadeType: CascadeType;
     pivotEntity?: () => Function;
     pivotLocalKey?: string;
     pivotForeignKey?: string;
+    oneToOneOwner?: OneToOneOwner;
 }
 
 const _columnMap = new Map<Function, ColumnMeta[]>();
@@ -138,6 +144,8 @@ export function Column(options: ColumnOptions) {
         if (options.readOnly !== undefined) meta.readOnly = options.readOnly;
         if (options.allowedValues !== undefined) meta.allowedValues = options.allowedValues;
         if (options.languages !== undefined) meta.languages = options.languages;
+        if (options.default !== undefined) meta.default = options.default;
+        if (options.expose !== undefined) meta.expose = options.expose;
 
         addColumn(getCtor(target), meta);
     };
@@ -183,7 +191,7 @@ export function DeletedBy(columnName: string) {
 export function OneToMany(
     target: () => Function,
     foreignKey: string,
-    cascadeType: CascadeType = "detail"
+    cascadeType: CascadeType
 ) {
     return function (proto: any, propertyName: string): void {
         addRelation(getCtor(proto), {
@@ -199,7 +207,7 @@ export function OneToMany(
 export function ManyToOne(
     target: () => Function,
     foreignKey: string,
-    cascadeType: CascadeType = "lookup"
+    cascadeType: CascadeType
 ) {
     return function (proto: any, propertyName: string): void {
         addRelation(getCtor(proto), {
@@ -215,7 +223,8 @@ export function ManyToOne(
 export function OneToOne(
     target: () => Function,
     foreignKey: string,
-    cascadeType: CascadeType = "detail"
+    cascadeType: CascadeType,
+    owner: OneToOneOwner,
 ) {
     return function (proto: any, propertyName: string): void {
         addRelation(getCtor(proto), {
@@ -224,6 +233,7 @@ export function OneToOne(
             target,
             foreignKey,
             cascadeType,
+            oneToOneOwner: owner,
         });
     };
 }
@@ -232,13 +242,15 @@ export function ManyToMany(
     target: () => Function,
     pivotEntity: () => Function,
     pivotLocalKey: string,
-    pivotForeignKey: string
+    pivotForeignKey: string,
+    cascadeType: CascadeType,
 ) {
     return function (proto: any, propertyName: string): void {
         addRelation(getCtor(proto), {
             propertyName,
             type: "ManyToMany",
             target,
+            cascadeType,
             pivotEntity,
             pivotLocalKey,
             pivotForeignKey,

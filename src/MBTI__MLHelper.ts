@@ -15,6 +15,43 @@ export const DEFAULT_LANGUAGES: string[] = ["en_US", "zh_CN", "my_MM"];
 
 export class MLHelper {
 
+    private static _isOptionalLocale(lang: string): boolean {
+        return lang === "my_MM" || lang === "zh_CN";
+    }
+
+    private static _normalizeTextForWrite(lang: string, value: unknown): string {
+        if (value === null || value === undefined) {
+            // Explicit rule: optional locales should be skipped when null/undefined.
+            if (MLHelper._isOptionalLocale(lang)) return "";
+            return "";
+        }
+
+        if (typeof value !== "string") return String(value);
+
+        return value;
+    }
+
+    private static _normalizeMLValue(value: MLValue | null | undefined, col?: ColumnMeta): MLValue {
+        const langs = col?.languages ?? DEFAULT_LANGUAGES;
+        const result: MLValue = {};
+
+        for (const lang of langs) {
+            result[lang] = null;
+        }
+
+        if (!value) return result;
+
+        for (const [lang, text] of Object.entries(value)) {
+            if (text === undefined || text === null || text === "") {
+                result[lang] = null;
+            } else {
+                result[lang] = text;
+            }
+        }
+
+        return result;
+    }
+
     // -------------------------------------------------------------------------
     // create — insert CustomResource + CustomResourceValue rows
     // returns new resourceId
@@ -39,7 +76,9 @@ export class MLHelper {
     // -------------------------------------------------------------------------
 
     static resolveAll(resourceId: string): MLValue {
-        if (!resourceId) return {};
+        if (!resourceId) {
+            return MLHelper._normalizeMLValue({}, undefined);
+        }
 
         const raws = db.setup("CustomResourceValue").queryByCondition({
             conjunction: db.Conjunction.AND,
@@ -54,7 +93,8 @@ export class MLHelper {
                 result[raw.language] = raw.value;
             }
         }
-        return result;
+
+        return MLHelper._normalizeMLValue(result, undefined);
     }
 
     // -------------------------------------------------------------------------
@@ -75,8 +115,17 @@ export class MLHelper {
 
         for (const raw of raws) {
             if (!raw.name || !raw.language) continue;
-            if (!result.has(raw.name)) result.set(raw.name, {});
-            result.get(raw.name)![raw.language] = raw.value ?? "";
+            if (!result.has(raw.name)) {
+                result.set(raw.name, MLHelper._normalizeMLValue({}, undefined));
+            }
+
+            result.get(raw.name)![raw.language] = raw.value ?? null;
+        }
+
+        for (const id of ids) {
+            if (!result.has(id)) {
+                result.set(id, MLHelper._normalizeMLValue({}, undefined));
+            }
         }
 
         return result;
@@ -107,8 +156,8 @@ export class MLHelper {
         const toInsert: any[] = [];
 
         for (const lang of Array.from(allLangs)) {
-            const oldText = oldValue?.[lang] ?? "";
-            const newText = newValue?.[lang] ?? "";
+            const oldText = MLHelper._normalizeTextForWrite(lang, oldValue?.[lang]);
+            const newText = MLHelper._normalizeTextForWrite(lang, newValue?.[lang]);
 
             if (oldText === newText) continue; // no change — skip
 
@@ -174,7 +223,7 @@ export class MLHelper {
         // configured languages first
         for (const lang of langs) {
             seen.add(lang);
-            const text = value[lang];
+            const text = MLHelper._normalizeTextForWrite(lang, value[lang]);
             if (!text || text === "") continue;
             rows.push({ name: resourceId, language: lang, value: text });
         }
@@ -182,7 +231,7 @@ export class MLHelper {
         // any extra languages in the value object not in configured list
         for (const lang of Object.keys(value)) {
             if (seen.has(lang)) continue;
-            const text = value[lang];
+            const text = MLHelper._normalizeTextForWrite(lang, value[lang]);
             if (!text || text === "") continue;
             rows.push({ name: resourceId, language: lang, value: text });
         }

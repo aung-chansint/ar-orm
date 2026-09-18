@@ -21,6 +21,12 @@ import type {
     LoadRelationOptions,
     RelationKeys,
     QueryOperator,
+    ModelJSON,
+    ModelMutationData,
+    CreateOptions,
+    UpdateOptions,
+    SyncOptions,
+    DeleteWhereOptions,
 } from "./MBTI__ARTypes";
 import { MLHelper } from "./MBTI__MLHelper";
 import {
@@ -39,6 +45,8 @@ const BATCH_CHUNK_SIZE = 200;
 const RELATION_ID_CHUNK_SIZE = 300;
 const RELATION_PAGE_SIZE = 3000;
 const RELATION_MAX_ROWS = 50000;
+const CASCADE_PAGE_SIZE = 1000;
+const SYNC_PAGE_SIZE = 1000;
 
 const SYSTEM_FIELD_MAP: Record<string, string> = {
     createdAt: "createdDate",
@@ -67,6 +75,11 @@ const TYPE_OP_MAP: Record<string, string[]> = {
 
 type ModelClass<T extends Model> = (new () => T) & typeof Model;
 
+type ApplyDataOptions = {
+    relationMode?: "all" | "none" | "spec";
+    relationSpec?: Record<string, any>;
+};
+
 function toUtcISOString(val: any): string {
     if (val instanceof Date) return val.toISOString();
     if (typeof val === "string") return new Date(val).toISOString();
@@ -82,18 +95,48 @@ function toDateOrNull(val: any): Date | null {
     return new Date(val);
 }
 
-function _hasEmptyIn(where: Record<string, any>): boolean {
+function _hasEmptyIn(where: any): boolean {
+    if (!where || typeof where !== "object") return false;
+
     for (const val of Object.values(where)) {
+        const op = val as QueryOperator;
+
         if (
             val !== null &&
             typeof val === "object" &&
             !Array.isArray(val) &&
-            val._isOperator === true &&
-            val.op === "in" &&
-            Array.isArray(val.val) &&
-            val.val.length === 0
+            op._isOperator === true &&
+            op.op === "in" &&
+            Array.isArray(op.val) &&
+            op.val.length === 0
         ) {
             return true;
+        }
+    }
+
+    return false;
+}
+
+function _valuesEqual(a: any, b: any): boolean {
+    if (a === b) return true;
+
+    if (a instanceof Date && b instanceof Date) {
+        return a.getTime() === b.getTime();
+    }
+
+    if (Array.isArray(a) || Array.isArray(b)) {
+        try {
+            return JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+        } catch {
+            return false;
+        }
+    }
+
+    if (a && b && typeof a === "object" && typeof b === "object") {
+        try {
+            return JSON.stringify(a) === JSON.stringify(b);
+        } catch {
+            return false;
         }
     }
 
@@ -158,6 +201,8 @@ export class Model implements IModel {
     private static __columnsCache: Map<Function, ColumnMeta[]> = new Map();
     private static __relationsCache: Map<Function, RelationMeta[]> = new Map();
 
+    private static __columnDefaultsCache: Map<Function, Record<string, any>> = new Map();
+
     constructor() {
         this.__originalValues = new Map();
 
@@ -205,6 +250,167 @@ export class Model implements IModel {
         return Model._cachedRelations(this.constructor as Function);
     }
 
+    private _saveRelatedModel(item: Model, childSpec?: Record<string, any>): void {
+        if (childSpec) {
+            item.save({ relations: childSpec } as any);
+            return;
+        }
+
+        item.save();
+    }
+
+    private _deleteRelatedModel(item: Model, childSpec?: Record<string, any>): void {
+        if (childSpec) {
+            item.delete({ relations: childSpec } as any);
+            return;
+        }
+
+        item.delete();
+    }
+
+    private _assertSelfOwnedOneToOneAvailable(rel: RelationMeta, targetId: string): void {
+        if (!rel.foreignKey) return;
+
+        const ctor = this.constructor as ModelClass<Model>;
+        const where: Record<string, any> = {
+            [rel.foreignKey]: targetId,
+        };
+
+        if (this.id) {
+            where.id = { _isOperator: true, op: "ne", val: this.id };
+        }
+
+        const conflicts = ctor.find({
+            where: where as any,
+            withSoftDeleted: true,
+            limit: 1,
+        } as any) as Model[];
+
+        if (conflicts.length > 0) {
+            throw new ORMDuplicateError(rel.foreignKey);
+        }
+    }
+
+    private _loadSingleTargetOwnedOneToOne(
+        rel: RelationMeta,
+        options?: { withSoftDeleted?: boolean; onlySoftDeleted?: boolean }
+    ): Model | null {
+        if (!this.id || !rel.foreignKey) return null;
+
+        const TargetClass = rel.target() as ModelClass<Model>;
+        const matches = TargetClass.find({
+            where: { [rel.foreignKey]: this.id } as any,
+            ...(options?.withSoftDeleted ? { withSoftDeleted: true } : {}),
+            ...(options?.onlySoftDeleted ? { onlySoftDeleted: true } : {}),
+            limit: 2,
+        } as any) as Model[];
+
+        if (matches.length > 1) {
+            throw new ORMError(
+                "RelationIntegrityError",
+                `OneToOne relation '${(this.constructor as typeof Model).name}.${rel.propertyName}' has multiple rows for parent id '${this.id}'.`,
+                409
+            );
+        }
+
+        return matches[0] ?? null;
+    }
+
+    private _syncTargetOwnedOneToOneRelation(
+        rel: RelationMeta,
+        value: any,
+        childSpec: Record<string, any> | undefined,
+        isDirty: boolean
+    ): void {
+        if (!this.id) {
+            throw new ORMValidationError({
+                [rel.propertyName]: "Cannot save OneToOne target-owned relation before parent has an id.",
+            });
+        }
+
+        if (!rel.foreignKey) {
+            throw new ORMValidationError({
+                [rel.propertyName]: "OneToOne relation is missing foreignKey.",
+            });
+        }
+
+        const existing = this._loadSingleTargetOwnedOneToOne(rel, { withSoftDeleted: true });
+
+        if (value === null) {
+            if (!isDirty || !existing) return;
+
+            if (rel.cascadeType === "lookup") {
+                (existing as any)[rel.foreignKey] = null;
+                existing.__dirtyFields.add(rel.foreignKey);
+                this._saveRelatedModel(existing, childSpec);
+                return;
+            }
+
+            this._deleteRelatedModel(existing, childSpec);
+            return;
+        }
+
+        if (value === undefined) return;
+
+        if (!(value instanceof Model)) {
+            throw new ORMValidationError({
+                [rel.propertyName]: "OneToOne relation value must be a Model instance or null.",
+            });
+        }
+
+        const item = value as Model;
+        const TargetClass = rel.target() as ModelClass<Model>;
+
+        if (existing && (!item.id || item.id !== existing.id)) {
+            throw new ORMDuplicateError(rel.foreignKey);
+        }
+
+        if (item.id) {
+            const linked = TargetClass.findOne(item.id, { withSoftDeleted: true }) as Model | null;
+            const linkedParent = linked ? (linked as any)[rel.foreignKey] : null;
+
+            if (linkedParent && String(linkedParent) !== String(this.id)) {
+                throw new ORMDuplicateError(rel.foreignKey);
+            }
+        }
+
+        (item as any)[rel.foreignKey] = this.id;
+        item.__dirtyFields.add(rel.foreignKey);
+
+        this._saveRelatedModel(item, childSpec);
+
+        const verify = this._loadSingleTargetOwnedOneToOne(rel, { withSoftDeleted: true });
+
+        if (verify && item.id && verify.id !== item.id) {
+            throw new ORMDuplicateError(rel.foreignKey);
+        }
+    }
+
+    private _readSelfOwnedOneToOneForeignId(rel: RelationMeta): string | undefined {
+        if (!rel.foreignKey) return undefined;
+
+        const self = this as any;
+        const current = self[rel.foreignKey];
+
+        if (current !== null && current !== undefined && current !== "") {
+            return String(current);
+        }
+
+        if (!this.id) return undefined;
+
+        const ctor = this.constructor as ModelClass<Model>;
+        const col = ctor._columns().find(c => c.propertyName === rel.foreignKey);
+
+        if (!col) return undefined;
+
+        const raw = db.dynamicObject(ctor._tableName()).query(this.id);
+        const rawVal = raw?.[col.columnName];
+
+        if (rawVal === null || rawVal === undefined || rawVal === "") return undefined;
+
+        return String(rawVal);
+    }
+
     private _hasSoftDelete(): boolean {
         return !!(this.constructor as typeof Model)._deletedAtColumn();
     }
@@ -231,6 +437,537 @@ export class Model implements IModel {
         Model._ensureSchemaValidFor(ctor);
         ctor._columns();
         ctor._relations();
+    }
+
+    private static _columnDefaultFor(col: ColumnMeta): any {
+        switch (col.type) {
+            case "picklistMulti":
+                return [];
+            case "multiLanguage":
+                return {};
+            case "checkbox":
+                return false;
+            default:
+                return null;
+        }
+    }
+
+    private static _columnDefaults<T extends Model>(this: ModelClass<T>): Record<string, any> {
+        const cached = Model.__columnDefaultsCache.get(this);
+
+        if (cached) return cached;
+
+        const defaults: Record<string, any> = {};
+
+        for (const col of this._columns()) {
+            if (col.default !== undefined) {
+                defaults[col.propertyName] = col.default;
+                continue;
+            }
+
+            defaults[col.propertyName] = Model._columnDefaultFor(col);
+        }
+
+        Model.__columnDefaultsCache.set(this, defaults);
+
+        return defaults;
+    }
+
+    private static _applyData<T extends Model>(
+        instance: T,
+        data?: ModelMutationData<T>,
+        applyOptions?: ApplyDataOptions
+    ): void {
+        if (!data) return;
+
+        const columns = (instance.constructor as typeof Model)._columns();
+        const relations = (instance.constructor as typeof Model)._relations();
+        const columnsByProp = new Map(columns.map(c => [c.propertyName, c] as const));
+        const columnSet = new Set(columns.map(c => c.propertyName));
+        const relationMap = new Map(relations.map(r => [r.propertyName, r] as const));
+        const relationMode = applyOptions?.relationMode ?? "all";
+        const relationSpec = applyOptions?.relationSpec;
+        const allowRelation = (name: string): boolean => {
+            if (relationMode === "all") return true;
+            if (relationMode === "none") return false;
+            return !!relationSpec?.[name];
+        };
+
+        for (const [key, value] of Object.entries(data as Record<string, any>)) {
+            if (!columnSet.has(key) && !relationMap.has(key)) continue;
+            if (value === undefined) continue;
+
+            const rel = relationMap.get(key);
+
+            if (rel) {
+                if (!allowRelation(key)) continue;
+
+                if (value === null) {
+                    const current = (instance as any)[key];
+
+                    if (!_valuesEqual(current, null)) {
+                        (instance as any)[key] = null;
+                    }
+
+                    continue;
+                }
+
+                const TargetClass = rel.target() as ModelClass<Model>;
+
+                if (rel.type === "ManyToOne" || rel.type === "OneToOne") {
+                    const nextValue = value instanceof Model
+                        ? value
+                        : TargetClass._toModelInstance(value as any);
+
+                    const current = (instance as any)[key];
+
+                    const currentId = current instanceof Model ? current.id : current?.id;
+                    const nextId = nextValue instanceof Model ? nextValue.id : nextValue?.id;
+
+                    const bothModelLike =
+                        current &&
+                        nextValue &&
+                        typeof current === "object" &&
+                        typeof nextValue === "object";
+
+                    if (bothModelLike && currentId && nextId && String(currentId) === String(nextId)) {
+                        if (nextValue instanceof Model) {
+                            const currentModel = current as Model;
+
+                            if (nextValue.__dirtyFields.size > 0 || nextValue.__relationDirty.size > 0) {
+                                Model._applyData(currentModel as any, nextValue as any, {
+                                    relationMode: "all",
+                                });
+                            }
+                        }
+
+                        continue;
+                    }
+
+                    if (value instanceof Model) {
+                        if (!_valuesEqual(current, value)) {
+                            (instance as any)[key] = value;
+                        }
+                    } else {
+                        if (!_valuesEqual(current, nextValue)) {
+                            (instance as any)[key] = nextValue;
+                        }
+                    }
+
+                    continue;
+                }
+
+                if (!Array.isArray(value)) {
+                    throw new ORMValidationError({
+                        [key]: "Relation value must be an array.",
+                    });
+                }
+
+                const nextList = value.map((item: any) => {
+                    if (item instanceof Model) return item;
+                    return TargetClass._toModelInstance(item as any);
+                });
+
+                const currentList = (instance as any)[key];
+
+                if (!_valuesEqual(currentList, nextList)) {
+                    (instance as any)[key] = nextList;
+                }
+
+                continue;
+            }
+
+            const col = columnsByProp.get(key);
+
+            if (!col) continue;
+
+            const current = (instance as any)[key];
+
+            if (col.type === "date") {
+                const normalized = value === null ? null : toDateOnlyString(value);
+
+                if (!_valuesEqual(current, normalized)) {
+                    (instance as any)[key] = normalized;
+                }
+
+                continue;
+            }
+
+            if (col.type === "datetime") {
+                let normalized: Date | null;
+
+                if (value === null || value === "") {
+                    normalized = null;
+                } else if (value instanceof Date) {
+                    normalized = value;
+                } else {
+                    normalized = new Date(value as any);
+                }
+
+                const sameDate =
+                    current instanceof Date &&
+                    normalized instanceof Date &&
+                    current.getTime() === normalized.getTime();
+
+                if (!sameDate && !_valuesEqual(current, normalized)) {
+                    (instance as any)[key] = normalized;
+                }
+
+                continue;
+            }
+
+            if (col.type === "picklistMulti") {
+                const normalized = Array.isArray(value)
+                    ? value
+                    : typeof value === "string"
+                        ? (value.trim() === "" ? [] : value.split(";").filter((v: string) => v !== ""))
+                        : value === null
+                            ? []
+                            : value;
+
+                if (!_valuesEqual(current, normalized)) {
+                    (instance as any)[key] = normalized;
+                }
+
+                continue;
+            }
+
+            if (!_valuesEqual(current, value)) {
+                (instance as any)[key] = value;
+            }
+        }
+    }
+
+    private static _instantiateWithDefaults<T extends Model>(this: ModelClass<T>): T {
+        const instance = new this();
+        const defaults = this._columnDefaults();
+
+        for (const [key, value] of Object.entries(defaults)) {
+            if (value === null) continue;
+            (instance as any)[key] = Model._resolveDefaultValue(value);
+        }
+
+        return instance;
+    }
+
+    private static _toModelInstance<T extends Model>(
+        this: ModelClass<T>,
+        input: T | ModelMutationData<T>
+    ): T {
+        if (input instanceof Model) {
+            return input as T;
+        }
+
+        const instance = this._instantiateWithDefaults();
+        Model._applyData(instance, input);
+
+        return instance;
+    }
+
+    private static _resolveDefaultValue(value: any): any {
+        const resolved = typeof value === "function" ? value() : value;
+
+        if (resolved instanceof Date) return new Date(resolved.getTime());
+        if (Array.isArray(resolved)) return [...resolved];
+        if (resolved && typeof resolved === "object") {
+            const proto = Object.getPrototypeOf(resolved);
+
+            if (proto === Object.prototype || proto === null) {
+                return { ...resolved };
+            }
+        }
+
+        return resolved;
+    }
+
+    static create<T extends Model>(
+        this: ModelClass<T>,
+        data?: ModelMutationData<T>,
+        options?: CreateOptions<T>
+    ): T {
+        Model._ensureSchemaValidFor(this);
+
+        const instance = this._toModelInstance((data ?? {}) as ModelMutationData<T>);
+
+        instance.save(options);
+
+        return instance;
+    }
+
+    static update<T extends Model>(
+        this: ModelClass<T>,
+        idOrWhere: string | WhereCondition<T>,
+        data: ModelMutationData<T>,
+        options?: UpdateOptions<T>
+    ): T {
+        Model._ensureSchemaValidFor(this);
+
+        const row = this.findOneOrFail(idOrWhere, {
+            ...(options?.withSoftDeleted !== undefined ? { withSoftDeleted: options.withSoftDeleted } : {}),
+            ...(options?.onlySoftDeleted !== undefined ? { onlySoftDeleted: options.onlySoftDeleted } : {}),
+            ...(options?.forUpdate !== undefined ? { forUpdate: options.forUpdate } : {}),
+        });
+
+        const applyDataOptions: ApplyDataOptions = options?.relations
+            ? {
+                relationMode: "spec",
+                relationSpec: options.relations as Record<string, any>,
+            }
+            : { relationMode: "none" };
+
+        Model._applyData(row, data, applyDataOptions);
+        row.save(options);
+
+        return row;
+    }
+
+    static sync<T extends Model>(
+        this: ModelClass<T>,
+        where: WhereCondition<T>,
+        records: Array<ModelMutationData<T>>,
+        options?: SyncOptions<T>
+    ): T[] {
+        return this.syncBy(where, records, undefined, options);
+    }
+
+    static syncBy<T extends Model>(
+        this: ModelClass<T>,
+        where: WhereCondition<T>,
+        records: Array<ModelMutationData<T>>,
+        by?: string[],
+        options?: SyncOptions<T>
+    ): T[] {
+        Model._ensureSchemaValidFor(this);
+
+        const isUsable = (v: any): boolean => v !== null && v !== undefined && v !== "";
+        const isOperatorLike = (v: any): boolean =>
+            !!v &&
+            typeof v === "object" &&
+            !Array.isArray(v) &&
+            (v as QueryOperator)._isOperator === true;
+
+        const compareKeys = (by && by.length > 0)
+            ? by
+            : ["id"];
+
+        const scopeDefaults: Record<string, any> = {};
+
+        for (const [key, value] of Object.entries((where ?? {}) as Record<string, any>)) {
+            if (value === undefined) continue;
+            if (isOperatorLike(value)) continue;
+            if (Array.isArray(value)) continue;
+
+            if (value && typeof value === "object" && !(value instanceof Date)) {
+                continue;
+            }
+
+            scopeDefaults[key] = value;
+        }
+
+        const applyScopeDefaults = (record: ModelMutationData<T>): ModelMutationData<T> => {
+            const next = { ...(record as Record<string, any>) };
+
+            for (const [key, value] of Object.entries(scopeDefaults)) {
+                if (!isUsable(next[key])) {
+                    next[key] = value;
+                }
+            }
+
+            return next as ModelMutationData<T>;
+        };
+
+        const buildKey = (source: any): string | null => {
+            const parts: string[] = [];
+
+            for (const key of compareKeys) {
+                const value = source?.[key];
+
+                if (!isUsable(value)) return null;
+
+                parts.push(`${key}:${String(value)}`);
+            }
+
+            return parts.join("|");
+        };
+
+        const buildWhereForPayload = (payload: ModelMutationData<T>): Record<string, any> | null => {
+            const filters: Record<string, any> = {};
+            const payloadRecord = payload as Record<string, any>;
+
+            for (const key of compareKeys) {
+                const value = payloadRecord[key];
+
+                if (!isUsable(value)) return null;
+
+                filters[key] = value;
+            }
+
+            return filters;
+        };
+
+        const validRecords = records
+            .filter(r => r !== null && r !== undefined)
+            .map(r => applyScopeDefaults(r));
+
+        const payloadByKey = new Map<string, ModelMutationData<T>>();
+
+        for (const record of validRecords) {
+            const key = buildKey(record);
+
+            if (!key) {
+                continue;
+            }
+
+            payloadByKey.set(key, record);
+        }
+
+        const touchedKeys = new Set<string>();
+        const rowsToDelete: T[] = [];
+        const result: T[] = [];
+
+        const totalExisting = this.count(where, {
+            ...(options?.withSoftDeleted !== undefined ? { withSoftDeleted: options.withSoftDeleted } : {}),
+            ...(options?.onlySoftDeleted !== undefined ? { onlySoftDeleted: options.onlySoftDeleted } : {}),
+        });
+
+        for (let offset = 0; offset < totalExisting; offset += SYNC_PAGE_SIZE) {
+            const existingPage = this.find({
+                where,
+                ...(options?.withSoftDeleted !== undefined ? { withSoftDeleted: options.withSoftDeleted } : {}),
+                ...(options?.onlySoftDeleted !== undefined ? { onlySoftDeleted: options.onlySoftDeleted } : {}),
+                ...(options?.forUpdate !== undefined ? { forUpdate: options.forUpdate } : {}),
+                orderBy: [{ field: "createdAt", order: "DESC" }],
+                limit: SYNC_PAGE_SIZE,
+                offset,
+            });
+
+            if (existingPage.length === 0) break;
+
+            for (const row of existingPage) {
+                const rowKey = buildKey(row);
+
+                if (!rowKey) continue;
+
+                const payload = payloadByKey.get(rowKey);
+
+                if (!payload) {
+                    if (options?.deleteMissing) {
+                        rowsToDelete.push(row);
+                    }
+                    continue;
+                }
+
+                Model._applyData(row, payload);
+                row.save(options);
+                touchedKeys.add(rowKey);
+                result.push(row);
+            }
+        }
+
+        for (const row of rowsToDelete) {
+            row.delete(options);
+        }
+
+        for (const record of validRecords) {
+            const payloadKey = buildKey(record);
+
+            if (!payloadKey) {
+                const created = this.create(record, options);
+                result.push(created);
+                continue;
+            }
+
+            if (touchedKeys.has(payloadKey)) {
+                continue;
+            }
+
+            if (compareKeys[0] !== "id") {
+                const payloadWhere = buildWhereForPayload(record);
+
+                if (payloadWhere) {
+                    const existingRow = this.findOne(payloadWhere, {
+                        ...(options?.withSoftDeleted !== undefined ? { withSoftDeleted: options.withSoftDeleted } : {}),
+                        ...(options?.onlySoftDeleted !== undefined ? { onlySoftDeleted: options.onlySoftDeleted } : {}),
+                        ...(options?.forUpdate !== undefined ? { forUpdate: options.forUpdate } : {}),
+                    });
+
+                    if (existingRow) {
+                        Model._applyData(existingRow, record);
+                        existingRow.save(options);
+                        result.push(existingRow);
+                        continue;
+                    }
+                }
+            }
+
+            const created = this.create(record, options);
+            result.push(created);
+        }
+
+        return result;
+    }
+
+    static delete<T extends Model>(
+        this: ModelClass<T>,
+        where: string | WhereCondition<T>,
+        options?: DeleteWhereOptions<T>
+    ): number {
+        Model._ensureSchemaValidFor(this);
+
+        let rows: T[] = [];
+
+        if (typeof where === "string") {
+            const one = this.findOne(where, {
+                ...(options?.withSoftDeleted !== undefined ? { withSoftDeleted: options.withSoftDeleted } : {}),
+                ...(options?.onlySoftDeleted !== undefined ? { onlySoftDeleted: options.onlySoftDeleted } : {}),
+                ...(options?.forUpdate !== undefined ? { forUpdate: options.forUpdate } : {}),
+            });
+
+            if (one) rows = [one];
+        } else {
+            if (_hasEmptyIn(where)) return 0;
+
+            const total = this.count(where, {
+                ...(options?.withSoftDeleted !== undefined ? { withSoftDeleted: options.withSoftDeleted } : {}),
+                ...(options?.onlySoftDeleted !== undefined ? { onlySoftDeleted: options.onlySoftDeleted } : {}),
+            });
+
+            for (let offset = 0; offset < total; offset += CASCADE_PAGE_SIZE) {
+                const page = this.find({
+                    where,
+                    ...(options?.withSoftDeleted !== undefined ? { withSoftDeleted: options.withSoftDeleted } : {}),
+                    ...(options?.onlySoftDeleted !== undefined ? { onlySoftDeleted: options.onlySoftDeleted } : {}),
+                    ...(options?.forUpdate !== undefined ? { forUpdate: options.forUpdate } : {}),
+                    orderBy: [{ field: "createdAt", order: "DESC" }],
+                    limit: CASCADE_PAGE_SIZE,
+                    offset,
+                });
+
+                if (page.length === 0) break;
+
+                rows = rows.concat(page);
+            }
+        }
+
+        if (rows.length === 0) return 0;
+
+        if (options?.force) {
+            this.forceBatchDelete(rows, options);
+        } else {
+            this.batchDelete(rows, options);
+        }
+
+        return rows.length;
+    }
+
+    private static _oneToOneOwner(rel: RelationMeta): "self" | "target" {
+        if (rel.oneToOneOwner === "self" || rel.oneToOneOwner === "target") {
+            return rel.oneToOneOwner;
+        }
+
+        throw new ORMValidationError({
+            schema: `OneToOne relation '${rel.propertyName}' is missing owner. Use 'self' or 'target'.`,
+        });
     }
 
     static _tableName(): string {
@@ -382,7 +1119,7 @@ export class Model implements IModel {
                 item instanceof Model &&
                 (!item.id || item.__dirtyFields.size > 0 || item.__relationDirty.size > 0)
             ) {
-                item.save(childSpec ? { relations: childSpec } : undefined);
+                this._saveRelatedModel(item, childSpec);
             }
 
             const foreignId = item instanceof Model ? item.id : item?.id;
@@ -521,6 +1258,7 @@ export class Model implements IModel {
 
         const columns = ctor._columns();
         const relations = ctor._relations();
+        const oneToOnePairFkSeen = new Set<string>();
 
         const columnProps = new Set<string>();
         const columnNames = new Set<string>();
@@ -587,6 +1325,18 @@ export class Model implements IModel {
                 });
             }
 
+            if (!rel.cascadeType) {
+                throw new ORMValidationError({
+                    schema: `Relation '${rel.propertyName}' in '${ctor.name}' is missing cascadeType. Use 'lookup' or 'master'.`,
+                });
+            }
+
+            if (!['lookup', 'master'].includes(rel.cascadeType)) {
+                throw new ORMValidationError({
+                    schema: `Relation '${rel.propertyName}' in '${ctor.name}' has invalid cascadeType '${rel.cascadeType}'. Use 'lookup' or 'master'.`,
+                });
+            }
+
             if (rel.type === "ManyToOne" || rel.type === "OneToOne" || rel.type === "OneToMany") {
                 if (!rel.foreignKey) {
                     throw new ORMValidationError({
@@ -595,12 +1345,93 @@ export class Model implements IModel {
                 }
             }
 
-            if (rel.type === "ManyToOne" || rel.type === "OneToOne") {
-                console.log("columnProps", columnProps)
+            if (rel.type === "ManyToOne") {
                 if (!columnProps.has(rel.foreignKey!)) {
                     throw new ORMValidationError({
                         schema: `Relation '${rel.propertyName}' in '${ctor.name}' uses missing foreignKey '${rel.foreignKey}'.`,
                     });
+                }
+            }
+
+            if (rel.type === "OneToOne") {
+                const owner = Model._oneToOneOwner(rel);
+                const targetCols = TargetClass._columns();
+                const targetProps = new Set(targetCols.map(c => c.propertyName));
+
+                if (owner === "self") {
+                    if (!columnProps.has(rel.foreignKey!)) {
+                        throw new ORMValidationError({
+                            schema: `OneToOne relation '${rel.propertyName}' in '${ctor.name}' uses missing self foreignKey '${rel.foreignKey}'.`,
+                        });
+                    }
+                } else if (!targetProps.has(rel.foreignKey!)) {
+                    throw new ORMValidationError({
+                        schema: `OneToOne relation '${rel.propertyName}' in '${ctor.name}' uses missing target foreignKey '${rel.foreignKey}' on '${TargetClass.name}'.`,
+                    });
+                }
+
+                const ownerCols = owner === "self" ? columns : targetCols;
+                const ownerCol = ownerCols.find(c => c.propertyName === rel.foreignKey);
+
+                if (!ownerCol) {
+                    throw new ORMValidationError({
+                        schema: `OneToOne relation '${rel.propertyName}' in '${ctor.name}' owner column '${rel.foreignKey}' was not found.`,
+                    });
+                }
+
+                if (!ownerCol.unique) {
+                    throw new ORMValidationError({
+                        schema: `OneToOne relation '${rel.propertyName}' in '${ctor.name}' owner foreignKey '${rel.foreignKey}' must be unique.`,
+                    });
+                }
+
+                if (rel.cascadeType === "lookup" && ownerCol.required) {
+                    throw new ORMValidationError({
+                        schema: `OneToOne relation '${rel.propertyName}' in '${ctor.name}' cannot use lookup with required foreignKey '${rel.foreignKey}'.`,
+                    });
+                }
+
+                const pairKey = `${getTableName(TargetClass) ?? TargetClass.name}:${rel.foreignKey}`;
+                if (oneToOnePairFkSeen.has(pairKey)) {
+                    throw new ORMValidationError({
+                        schema: `Duplicate OneToOne relation in '${ctor.name}' for target '${TargetClass.name}' and foreignKey '${rel.foreignKey}'. Use distinct foreignKey values.`,
+                    });
+                }
+                oneToOnePairFkSeen.add(pairKey);
+
+                const targetOneToOnes = TargetClass._relations().filter(r => {
+                    if (r.type !== "OneToOne") return false;
+
+                    try {
+                        return (r.target() as typeof Model) === ctor;
+                    } catch {
+                        return false;
+                    }
+                });
+
+                if (targetOneToOnes.length > 0) {
+                    const reverseMatches = targetOneToOnes.filter(r => r.foreignKey === rel.foreignKey);
+
+                    if (reverseMatches.length > 1) {
+                        throw new ORMValidationError({
+                            schema: `Target '${TargetClass.name}' has multiple OneToOne relations back to '${ctor.name}' with foreignKey '${rel.foreignKey}'.`,
+                        });
+                    }
+
+                    if (reverseMatches.length === 1) {
+                        const reverse = reverseMatches[0]!;
+                        const reverseOwner = Model._oneToOneOwner(reverse);
+
+                        if (owner === reverseOwner) {
+                            throw new ORMValidationError({
+                                schema: `OneToOne ownership mismatch between '${ctor.name}.${rel.propertyName}' and '${TargetClass.name}.${reverse.propertyName}'. Owners must be opposite.`,
+                            });
+                        }
+                    } else {
+                        throw new ORMValidationError({
+                            schema: `OneToOne foreignKey mismatch for '${ctor.name}.${rel.propertyName}'. Target '${TargetClass.name}' defines relation(s) back to '${ctor.name}' but none use foreignKey '${rel.foreignKey}'.`,
+                        });
+                    }
                 }
             }
 
@@ -800,11 +1631,11 @@ export class Model implements IModel {
 
     static _applySoftDeleteWhere<T extends Model>(
         this: ModelClass<T>,
-        where?: Record<string, any>,
+        where?: WhereCondition<T> | Record<string, any>,
         options?: { withSoftDeleted?: boolean; onlySoftDeleted?: boolean }
     ): Record<string, any> {
         const deletedAt = this._deletedAtColumn();
-        const next: Record<string, any> = { ...(where ?? {}) };
+        const next: Record<string, any> = { ...((where as Record<string, any>) ?? {}) };
 
         if (!deletedAt) return next;
 
@@ -882,7 +1713,11 @@ export class Model implements IModel {
                 self.__originalValues.set(col.propertyName, val);
             }
 
-            if ((col.type === "date" || col.type === "datetime") && typeof val === "string" && val !== "") {
+            if (col.type === "date" && val !== null && val !== undefined && val !== "") {
+                val = toDateOnlyString(val);
+            }
+
+            if (col.type === "datetime" && typeof val === "string" && val !== "") {
                 val = new Date(val);
             }
 
@@ -929,8 +1764,18 @@ export class Model implements IModel {
                 const rid = (instance as any).__originalValues?.get(col.propertyName);
                 if (!rid) continue;
 
+                const next = resolved.get(rid) ?? {};
+
+                if (col.languages && col.languages.length > 0) {
+                    for (const lang of col.languages) {
+                        if (!(lang in next)) {
+                            next[lang] = null;
+                        }
+                    }
+                }
+
                 Object.defineProperty(instance, col.propertyName, {
-                    value: resolved.get(rid) ?? {},
+                    value: next,
                     writable: true,
                     enumerable: true,
                     configurable: true,
@@ -939,18 +1784,54 @@ export class Model implements IModel {
         }
     }
 
-    toJSON(): Record<string, any> {
+    toJSON(): ModelJSON<this> {
         const columns = this._getColumns();
         const relations = this._getRelations();
         const self = this as any;
+        const selectedFields = self.__selectedFields as Set<string> | undefined;
 
-        const result: Record<string, any> = {
-            id: this.id,
-            createdAt: this.createdAt,
+        const includeSelected = (field: string): boolean => {
+            if (!selectedFields || selectedFields.size === 0) return true;
+            return selectedFields.has(field);
         };
 
+        const toUTCISO = (v: any) => {
+            if (v instanceof Date) return v.toISOString(); // UTC ISO
+            return v;
+        };
+
+        const toColumnJSON = (col: ColumnMeta, value: any) => {
+            if (col.type === "date") {
+                if (value === null || value === undefined || value === "") return value;
+                return toDateOnlyString(value);
+            }
+
+            if (col.type === "datetime") {
+                if (value === null || value === undefined || value === "") return value;
+                return toUtcISOString(value);
+            }
+
+            return toUTCISO(value);
+        };
+
+        const result: Record<string, any> = {};
+
+        if (includeSelected("id") && this.id !== undefined) {
+            result.id = this.id;
+        }
+
+        if (includeSelected("createdAt") && this.createdAt !== undefined) {
+            result.createdAt = toUTCISO(this.createdAt);
+        }
+
         for (const col of columns) {
-            result[col.propertyName] = self[col.propertyName];
+            if (col.expose === false) continue;
+            if (!includeSelected(col.propertyName)) continue;
+
+            const value = self[col.propertyName];
+            if (value === undefined) continue;
+
+            result[col.propertyName] = toColumnJSON(col, value);
         }
 
         for (const rel of relations) {
@@ -960,12 +1841,12 @@ export class Model implements IModel {
 
             if (Array.isArray(val)) {
                 result[rel.propertyName] = val.map((item: any) =>
-                    item && typeof item.toJSON === "function" ? item.toJSON() : item
+                    item && typeof item.toJSON === "function" ? item.toJSON() : toUTCISO(item)
                 );
             } else if (val && typeof val.toJSON === "function") {
                 result[rel.propertyName] = val.toJSON();
             } else {
-                result[rel.propertyName] = val;
+                result[rel.propertyName] = toUTCISO(val);
             }
         }
 
@@ -973,7 +1854,7 @@ export class Model implements IModel {
             result.pivot = this.__pivot;
         }
 
-        return result;
+        return result as ModelJSON<this>;
     }
 
     isDirty(field?: string): boolean {
@@ -1026,7 +1907,11 @@ export class Model implements IModel {
 
             if (val === undefined) continue;
 
-            if ((col.type === "date" || col.type === "datetime") && typeof val === "string" && val !== "") {
+            if (col.type === "date" && val !== null && val !== undefined && val !== "") {
+                val = toDateOnlyString(val);
+            }
+
+            if (col.type === "datetime" && typeof val === "string" && val !== "") {
                 val = new Date(val);
             }
 
@@ -1049,8 +1934,18 @@ export class Model implements IModel {
             if (col.type === "multiLanguage") {
                 self.__originalValues.set(col.propertyName, val);
 
+                const resolvedML = MLHelper.resolveAll(val as string);
+
+                if (col.languages && col.languages.length > 0) {
+                    for (const lang of col.languages) {
+                        if (!(lang in resolvedML)) {
+                            resolvedML[lang] = null;
+                        }
+                    }
+                }
+
                 Object.defineProperty(this, col.propertyName, {
-                    value: MLHelper.resolveAll(val as string),
+                    value: resolvedML,
                     writable: true,
                     enumerable: true,
                     configurable: true,
@@ -1075,12 +1970,19 @@ export class Model implements IModel {
         return this;
     }
 
-    private _validate(): void {
+    private _validate(options?: { onlyDirty?: boolean }): void {
         const columns = this._getColumns();
         const relations = this._getRelations();
         const self = this as any;
+        const onlyDirty = options?.onlyDirty === true;
+        const shouldValidateColumn = (propertyName: string): boolean => {
+            if (!onlyDirty) return true;
+            return this.__dirtyFields.has(propertyName);
+        };
 
         for (const col of columns) {
+            if (!shouldValidateColumn(col.propertyName)) continue;
+
             const value = self[col.propertyName];
 
             if (col.required) {
@@ -1227,8 +2129,16 @@ export class Model implements IModel {
 
         for (const rel of relations) {
             if (rel.cascadeType !== "master") continue;
-            if (rel.type !== "ManyToOne" && rel.type !== "OneToOne") continue;
+            if (rel.type !== "ManyToOne") continue;
             if (!rel.foreignKey) continue;
+
+            if (
+                onlyDirty &&
+                !this.__dirtyFields.has(rel.foreignKey) &&
+                !this.__relationDirty.has(rel.propertyName)
+            ) {
+                continue;
+            }
 
             const fkValue = self[rel.foreignKey];
 
@@ -1248,6 +2158,12 @@ export class Model implements IModel {
             if (col.readOnly) continue;
 
             let val = self[col.propertyName];
+
+            if (val === undefined && col.default !== undefined) {
+                val = Model._resolveDefaultValue(col.default);
+
+                self[col.propertyName] = val;
+            }
 
             if (val === undefined) continue;
 
@@ -1317,24 +2233,76 @@ export class Model implements IModel {
                 if (!isDirty && !specNode) continue;
 
                 const value = self[rel.propertyName];
+                const childSpec = specNode === true || !specNode ? undefined : specNode.relations;
+
+                if (rel.type === "ManyToOne") {
+                    if (!value) continue;
+
+                    const item = value as Model;
+
+                    if (!item.id || item.__dirtyFields.size > 0 || item.__relationDirty.size > 0) {
+                        this._saveRelatedModel(item, childSpec);
+                    }
+
+                    if (rel.foreignKey) {
+                        self[rel.foreignKey] = item.id;
+                        this.__dirtyFields.add(rel.foreignKey);
+                    }
+
+                    this.__relationDirty.delete(rel.propertyName);
+                    continue;
+                }
+
+                const owner = Model._oneToOneOwner(rel);
+
+                if (owner === "target") {
+                    continue;
+                }
+
+                if (!rel.foreignKey) continue;
+
+                if (value === null) {
+                    if (!isDirty) continue;
+
+                    const previousFk = this._readSelfOwnedOneToOneForeignId(rel);
+
+                    if (previousFk && rel.cascadeType === "master") {
+                        const TargetClass = rel.target() as ModelClass<Model>;
+                        const related = TargetClass.findOne(previousFk, { withSoftDeleted: true }) as Model | null;
+
+                        if (related) {
+                            this._deleteRelatedModel(related, childSpec);
+                        }
+                    }
+
+                    self[rel.foreignKey] = null;
+                    this.__dirtyFields.add(rel.foreignKey);
+                    this.__relationDirty.delete(rel.propertyName);
+                    continue;
+                }
+
                 if (!value) continue;
 
-                const childSpec = specNode === true || !specNode ? undefined : specNode.relations;
                 const item = value as Model;
 
                 if (!item.id || item.__dirtyFields.size > 0 || item.__relationDirty.size > 0) {
-                    item.save(childSpec ? { relations: childSpec } : undefined);
+                    this._saveRelatedModel(item, childSpec);
                 }
 
-                if (rel.foreignKey) {
-                    self[rel.foreignKey] = item.id;
-                    this.__dirtyFields.add(rel.foreignKey);
+                if (!item.id) {
+                    throw new ORMValidationError({
+                        [rel.propertyName]: "OneToOne relation must reference a saved model with id.",
+                    });
                 }
 
+                this._assertSelfOwnedOneToOneAvailable(rel, item.id);
+
+                self[rel.foreignKey] = item.id;
+                this.__dirtyFields.add(rel.foreignKey);
                 this.__relationDirty.delete(rel.propertyName);
             }
 
-            this._validate();
+            this._validate({ onlyDirty: !this.__isNew });
 
             if (this.__isNew) {
                 const record = this._buildInsertRecord(columns);
@@ -1400,23 +2368,44 @@ export class Model implements IModel {
 
             const value = self[rel.propertyName];
 
-            if (value === undefined || value === null) continue;
-
             const childSpec = specNode === true || specNode === undefined ? undefined : specNode.relations;
 
             switch (rel.type) {
                 case "ManyToOne":
+                    if (value === undefined || value === null) continue;
+
+                    {
+                        const item = value as Model;
+
+                        if (!item.id || item.__dirtyFields.size > 0 || item.__relationDirty.size > 0) {
+                            this._saveRelatedModel(item, childSpec);
+                        }
+
+                        break;
+                    }
+
                 case "OneToOne": {
+                    const owner = Model._oneToOneOwner(rel);
+
+                    if (owner === "target") {
+                        this._syncTargetOwnedOneToOneRelation(rel, value, childSpec, isDirty);
+                        break;
+                    }
+
+                    if (value === undefined || value === null) continue;
+
                     const item = value as Model;
 
                     if (!item.id || item.__dirtyFields.size > 0 || item.__relationDirty.size > 0) {
-                        item.save(childSpec ? { relations: childSpec } : undefined);
+                        this._saveRelatedModel(item, childSpec);
                     }
 
                     break;
                 }
 
                 case "OneToMany": {
+                    if (value === undefined || value === null) continue;
+
                     const items = (value as Model[]) ?? [];
 
                     for (const item of items) {
@@ -1425,13 +2414,15 @@ export class Model implements IModel {
                             item.__dirtyFields.add(rel.foreignKey);
                         }
 
-                        item.save(childSpec ? { relations: childSpec } : undefined);
+                        this._saveRelatedModel(item, childSpec);
                     }
 
                     break;
                 }
 
                 case "ManyToMany": {
+                    if (value === undefined || value === null) continue;
+
                     this._syncManyToManyRelation(rel, value, childSpec);
                     break;
                 }
@@ -1542,47 +2533,88 @@ export class Model implements IModel {
 
     private _cascadeDelete(options?: DeleteOptions<this>, force = false): void {
         const relations = this._getRelations();
-        const self = this as any;
 
         const runRelation = (rel: RelationMeta): void => {
             const TargetClass = rel.target() as ModelClass<Model>;
 
+            const runPaged = (loader: () => Model[], work: (item: Model) => void): void => {
+                while (true) {
+                    const page = loader();
+
+                    if (!page || page.length === 0) break;
+
+                    for (const item of page) {
+                        work(item);
+                    }
+
+                    if (page.length < CASCADE_PAGE_SIZE) break;
+                }
+            };
+
             if (rel.type === "OneToMany") {
                 if (!rel.foreignKey || !this.id) return;
+                const foreignKey = rel.foreignKey;
 
-                const children = TargetClass.find({
-                    where: { [rel.foreignKey]: this.id } as any,
-                    withSoftDeleted: force,
-                    limit: 5000,
-                }) as Model[];
-
-                for (const child of children) {
-                    if (force) child.forceDelete();
-                    else child.delete();
-                }
+                runPaged(
+                    () =>
+                        TargetClass.find({
+                            where: { [foreignKey]: this.id } as any,
+                            withSoftDeleted: force,
+                            limit: CASCADE_PAGE_SIZE,
+                            orderBy: [{ field: "createdAt", order: "DESC" }] as any,
+                        } as any) as Model[],
+                    (child: Model) => {
+                        if (force) child.forceDelete();
+                        else child.delete();
+                    }
+                );
 
                 return;
             }
 
             if (rel.type === "OneToOne") {
                 if (!rel.foreignKey) return;
+                const foreignKey = rel.foreignKey;
 
-                const fkValue = self[rel.foreignKey];
+                const owner = Model._oneToOneOwner(rel);
 
-                if (!fkValue) return;
+                if (owner === "self") {
+                    const fkValue = this._readSelfOwnedOneToOneForeignId(rel);
 
-                const related = TargetClass.findOne(fkValue, { withSoftDeleted: force }) as Model | null;
+                    if (!fkValue) return;
 
-                if (!related) return;
+                    const related = TargetClass.findOne(fkValue, { withSoftDeleted: force }) as Model | null;
 
-                if (force) related.forceDelete();
-                else related.delete();
+                    if (!related) return;
+
+                    if (force) related.forceDelete();
+                    else related.delete();
+
+                    return;
+                }
+
+                if (!this.id) return;
+
+                runPaged(
+                    () =>
+                        TargetClass.find({
+                            where: { [foreignKey]: this.id } as any,
+                            withSoftDeleted: force,
+                            limit: CASCADE_PAGE_SIZE,
+                            orderBy: [{ field: "createdAt", order: "DESC" }] as any,
+                        } as any) as Model[],
+                    (child: Model) => {
+                        if (force) child.forceDelete();
+                        else child.delete();
+                    }
+                );
 
                 return;
             }
 
             if (rel.type === "ManyToMany") {
                 if (!rel.pivotEntity || !rel.pivotLocalKey) return;
+                const pivotLocalKey = rel.pivotLocalKey;
 
                 const PivotClass = rel.pivotEntity() as ModelClass<Model>;
                 const pivotColumns = PivotClass._columns();
@@ -1596,14 +2628,17 @@ export class Model implements IModel {
                 };
 
                 if (!force && PivotClass._deletedAtColumn()) {
-                    const pivots = PivotClass.find({
-                        where: { [rel.pivotLocalKey]: this.id } as any,
-                        limit: 5000,
-                    }) as Model[];
-
-                    for (const pivot of pivots) {
-                        pivot.delete();
-                    }
+                    runPaged(
+                        () =>
+                            PivotClass.find({
+                                where: { [pivotLocalKey]: this.id } as any,
+                                limit: CASCADE_PAGE_SIZE,
+                                orderBy: [{ field: "createdAt", order: "DESC" }] as any,
+                            } as any) as Model[],
+                        (pivot: Model) => {
+                            pivot.delete();
+                        }
+                    );
 
                     return;
                 }
@@ -1675,55 +2710,96 @@ export class Model implements IModel {
 
     private _cascadeRestore(options?: RestoreOptions<this>): void {
         const relations = this._getRelations();
-        const self = this as any;
 
         const runRelation = (rel: RelationMeta): void => {
             const TargetClass = rel.target() as ModelClass<Model>;
+
+            const runPaged = (loader: () => Model[], work: (item: Model) => void): void => {
+                while (true) {
+                    const page = loader();
+
+                    if (!page || page.length === 0) break;
+
+                    for (const item of page) {
+                        work(item);
+                    }
+
+                    if (page.length < CASCADE_PAGE_SIZE) break;
+                }
+            };
 
             if (!TargetClass._deletedAtColumn()) return;
 
             if (rel.type === "OneToMany") {
                 if (!rel.foreignKey || !this.id) return;
+                const foreignKey = rel.foreignKey;
 
-                const children = TargetClass.find({
-                    where: { [rel.foreignKey]: this.id } as any,
-                    onlySoftDeleted: true,
-                    limit: 5000,
-                }) as Model[];
-
-                for (const child of children) child.restore();
+                runPaged(
+                    () =>
+                        TargetClass.find({
+                            where: { [foreignKey]: this.id } as any,
+                            onlySoftDeleted: true,
+                            limit: CASCADE_PAGE_SIZE,
+                            orderBy: [{ field: "createdAt", order: "DESC" }] as any,
+                        } as any) as Model[],
+                    (child: Model) => child.restore()
+                );
 
                 return;
             }
 
             if (rel.type === "OneToOne") {
                 if (!rel.foreignKey) return;
+                const foreignKey = rel.foreignKey;
 
-                const fkValue = self[rel.foreignKey];
+                const owner = Model._oneToOneOwner(rel);
 
-                if (!fkValue) return;
+                if (owner === "self") {
+                    const fkValue = this._readSelfOwnedOneToOneForeignId(rel);
 
-                const related = TargetClass.findOne(fkValue, { withSoftDeleted: true }) as Model | null;
+                    if (!fkValue) return;
 
-                if (related && (related as any).deletedAt) related.restore();
+                    const related = TargetClass.findOne(fkValue, { withSoftDeleted: true }) as Model | null;
+
+                    if (related && (related as any).deletedAt) related.restore();
+
+                    return;
+                }
+
+                if (!this.id) return;
+
+                runPaged(
+                    () =>
+                        TargetClass.find({
+                            where: { [foreignKey]: this.id } as any,
+                            onlySoftDeleted: true,
+                            limit: CASCADE_PAGE_SIZE,
+                            orderBy: [{ field: "createdAt", order: "DESC" }] as any,
+                        } as any) as Model[],
+                    (child: Model) => child.restore()
+                );
 
                 return;
             }
 
             if (rel.type === "ManyToMany") {
                 if (!rel.pivotEntity || !rel.pivotLocalKey) return;
+                const pivotLocalKey = rel.pivotLocalKey;
 
                 const PivotClass = rel.pivotEntity() as ModelClass<Model>;
 
                 if (!PivotClass._deletedAtColumn()) return;
 
-                const pivots = PivotClass.find({
-                    where: { [rel.pivotLocalKey]: this.id } as any,
-                    onlySoftDeleted: true,
-                    limit: 5000,
-                }) as Model[];
-
-                for (const pivot of pivots) pivot.restore();
+                runPaged(
+                    () =>
+                        PivotClass.find({
+                            where: { [pivotLocalKey]: this.id } as any,
+                            onlySoftDeleted: true,
+                            limit: CASCADE_PAGE_SIZE,
+                            orderBy: [{ field: "createdAt", order: "DESC" }] as any,
+                        } as any) as Model[],
+                    (pivot: Model) => pivot.restore()
+                );
             }
         };
 
@@ -1744,27 +2820,41 @@ export class Model implements IModel {
     private static _normalizeRelationNode(
         node: RelationNode<any> | true | undefined
     ): {
-        where?: Record<string, any> | undefined;
-        pivotWhere?: Record<string, any> | undefined;
-        relations?: RelationSpec<any> | undefined;
-        select?: string[] | undefined;
-        orderBy?: any[] | undefined;
-        limit?: number | undefined;
-        withSoftDeleted?: boolean | undefined;
-        onlySoftDeleted?: boolean | undefined;
+        where?: Record<string, any>;
+        pivotWhere?: Record<string, any>;
+        relations?: RelationSpec<any>;
+        select?: string[];
+        orderBy?: any[];
+        limit?: number;
+        withSoftDeleted?: boolean;
+        onlySoftDeleted?: boolean;
+        forUpdate?: boolean;
     } {
         if (!node || node === true) return {};
 
-        return {
-            where: node.where as any,
-            pivotWhere: node.pivotWhere,
-            relations: node.relations as any,
-            select: node.select as string[] | undefined,
-            orderBy: node.orderBy as any[] | undefined,
-            limit: node.limit,
-            withSoftDeleted: node.withSoftDeleted,
-            onlySoftDeleted: node.onlySoftDeleted,
-        };
+        const normalized: {
+            where?: Record<string, any>;
+            pivotWhere?: Record<string, any>;
+            relations?: RelationSpec<any>;
+            select?: string[];
+            orderBy?: any[];
+            limit?: number;
+            withSoftDeleted?: boolean;
+            onlySoftDeleted?: boolean;
+            forUpdate?: boolean;
+        } = {};
+
+        if (node.where !== undefined) normalized.where = node.where as Record<string, any>;
+        if (node.pivotWhere !== undefined) normalized.pivotWhere = node.pivotWhere;
+        if (node.relations !== undefined) normalized.relations = node.relations;
+        if (node.select !== undefined) normalized.select = node.select as string[];
+        if (node.orderBy !== undefined) normalized.orderBy = node.orderBy;
+        if (node.limit !== undefined) normalized.limit = node.limit;
+        if (node.withSoftDeleted !== undefined) normalized.withSoftDeleted = node.withSoftDeleted;
+        if (node.onlySoftDeleted !== undefined) normalized.onlySoftDeleted = node.onlySoftDeleted;
+        if (node.forUpdate !== undefined) normalized.forUpdate = node.forUpdate;
+
+        return normalized;
     }
 
     private static _ensureSelect(
@@ -1825,26 +2915,17 @@ export class Model implements IModel {
         TargetClass: ModelClass<T>,
         where: Record<string, any>,
         options?: {
-            orderBy?: any[] | undefined;
-            withSoftDeleted?: boolean | undefined;
-            onlySoftDeleted?: boolean | undefined;
-            relationName?: string | undefined;
+            orderBy?: any[];
+            withSoftDeleted?: boolean;
+            onlySoftDeleted?: boolean;
+            relationName?: string;
+            forUpdate?: boolean;
         }
     ): any[] {
         if (_hasEmptyIn(where)) return [];
 
         const obj = db.dynamicObject(TargetClass._tableName());
-        const softDeleteOptions = options
-            ? {
-                ...(options.withSoftDeleted !== undefined
-                    ? { withSoftDeleted: options.withSoftDeleted }
-                    : {}),
-                ...(options.onlySoftDeleted !== undefined
-                    ? { onlySoftDeleted: options.onlySoftDeleted }
-                    : {}),
-            }
-            : undefined;
-        const finalWhere = TargetClass._applySoftDeleteWhere(where, softDeleteOptions);
+        const finalWhere = TargetClass._applySoftDeleteWhere(where, options);
         const cond = TargetClass._buildCondition(finalWhere);
         const result: any[] = [];
 
@@ -1856,6 +2937,10 @@ export class Model implements IModel {
                 skip,
                 orderby: Model._buildOrderByOptions(TargetClass, options?.orderBy),
             };
+
+            if (options?.forUpdate) {
+                queryOptions.forUpdate = true;
+            }
 
             const page = cond.conditions.length > 0
                 ? obj.queryByCondition(cond, { options: queryOptions })
@@ -1922,8 +3007,8 @@ export class Model implements IModel {
     }
 
     private static _relationOrderBy(node: {
-        orderBy?: any[] | undefined;
-        limit?: number | undefined;
+        orderBy?: any[];
+        limit?: number;
     }): any[] | undefined {
         if (node.orderBy && node.orderBy.length > 0) return node.orderBy;
 
@@ -1936,7 +3021,7 @@ export class Model implements IModel {
 
     private static _applyRelationLimit<T extends Model>(
         rows: T[],
-        node: { limit?: number | undefined }
+        node: { limit?: number }
     ): T[] {
         if (node.limit === undefined) return rows;
         if (node.limit <= 0) return [];
@@ -2018,14 +3103,15 @@ export class Model implements IModel {
         parents: T[],
         rel: RelationMeta,
         node: {
-            where?: Record<string, any> | undefined;
-            pivotWhere?: Record<string, any> | undefined;
-            relations?: RelationSpec<any> | undefined;
-            select?: string[] | undefined;
-            orderBy?: any[] | undefined;
-            limit?: number | undefined;
-            withSoftDeleted?: boolean | undefined;
-            onlySoftDeleted?: boolean | undefined;
+            where?: Record<string, any>;
+            pivotWhere?: Record<string, any>;
+            relations?: RelationSpec<any>;
+            select?: string[];
+            orderBy?: any[];
+            limit?: number;
+            withSoftDeleted?: boolean;
+            onlySoftDeleted?: boolean;
+            forUpdate?: boolean;
         }
     ): void {
         const TargetClass = rel.target() as ModelClass<Model>;
@@ -2033,12 +3119,12 @@ export class Model implements IModel {
         const orderBy = Model._relationOrderBy(node);
 
         switch (rel.type) {
-            case "ManyToOne":
-            case "OneToOne": {
+            case "ManyToOne": {
                 if (!rel.foreignKey) return;
+                const foreignKey = rel.foreignKey;
 
                 const fkValues = Model._uniqueStrings(
-                    parents.map(parent => (parent as any)[rel.foreignKey!])
+                    parents.map(parent => (parent as any)[foreignKey])
                 );
 
                 const targetById = new Map<string, Model>();
@@ -2050,9 +3136,10 @@ export class Model implements IModel {
                     };
 
                     const raws = Model._queryAllRaw(TargetClass, where, {
-                        orderBy,
-                        withSoftDeleted: node.withSoftDeleted,
-                        onlySoftDeleted: node.onlySoftDeleted,
+                        ...(orderBy ? { orderBy } : {}),
+                        ...(node.withSoftDeleted !== undefined ? { withSoftDeleted: node.withSoftDeleted } : {}),
+                        ...(node.onlySoftDeleted !== undefined ? { onlySoftDeleted: node.onlySoftDeleted } : {}),
+                        ...(node.forUpdate !== undefined ? { forUpdate: node.forUpdate } : {}),
                         relationName: rel.propertyName,
                     });
 
@@ -2064,7 +3151,7 @@ export class Model implements IModel {
                 }
 
                 for (const parent of parents) {
-                    const fk = (parent as any)[rel.foreignKey];
+                    const fk = (parent as any)[foreignKey];
 
                     Model._assignLoadedRelation(
                         parent,
@@ -2076,32 +3163,130 @@ export class Model implements IModel {
                 break;
             }
 
-            case "OneToMany": {
+            case "OneToOne": {
                 if (!rel.foreignKey) return;
+                const foreignKey = rel.foreignKey;
+
+                const owner = Model._oneToOneOwner(rel);
+
+                if (owner === "self") {
+                    const fkValues = Model._uniqueStrings(
+                        parents.map(parent => (parent as any)[foreignKey])
+                    );
+
+                    const targetById = new Map<string, Model>();
+
+                    for (const chunk of _chunk(fkValues, RELATION_ID_CHUNK_SIZE)) {
+                        const where = {
+                            ...(node.where ?? {}),
+                            id: { _isOperator: true, op: "in", val: chunk },
+                        };
+
+                        const raws = Model._queryAllRaw(TargetClass, where, {
+                            ...(orderBy ? { orderBy } : {}),
+                            ...(node.withSoftDeleted !== undefined ? { withSoftDeleted: node.withSoftDeleted } : {}),
+                            ...(node.onlySoftDeleted !== undefined ? { onlySoftDeleted: node.onlySoftDeleted } : {}),
+                            ...(node.forUpdate !== undefined ? { forUpdate: node.forUpdate } : {}),
+                            relationName: rel.propertyName,
+                        });
+
+                        const instances = Model._mapRawList(TargetClass, raws, node.select);
+
+                        for (const item of instances) {
+                            if (item.id) targetById.set(item.id, item);
+                        }
+                    }
+
+                    for (const parent of parents) {
+                        const fk = (parent as any)[foreignKey];
+
+                        Model._assignLoadedRelation(
+                            parent,
+                            rel.propertyName,
+                            fk ? targetById.get(String(fk)) ?? null : null
+                        );
+                    }
+
+                    break;
+                }
 
                 const parentIds = Model._uniqueStrings(parents.map(parent => parent.id));
                 const grouped = new Map<string, Model[]>();
-                const select = Model._ensureSelect(node.select, [rel.foreignKey]);
+                const select = Model._ensureSelect(node.select, [foreignKey]);
 
                 for (const id of parentIds) grouped.set(id, []);
 
                 for (const chunk of _chunk(parentIds, RELATION_ID_CHUNK_SIZE)) {
                     const where = {
                         ...(node.where ?? {}),
-                        [rel.foreignKey]: { _isOperator: true, op: "in", val: chunk },
+                        [foreignKey]: { _isOperator: true, op: "in", val: chunk },
                     };
 
                     const raws = Model._queryAllRaw(TargetClass, where, {
-                        orderBy,
-                        withSoftDeleted: node.withSoftDeleted,
-                        onlySoftDeleted: node.onlySoftDeleted,
+                        ...(orderBy ? { orderBy } : {}),
+                        ...(node.withSoftDeleted !== undefined ? { withSoftDeleted: node.withSoftDeleted } : {}),
+                        ...(node.onlySoftDeleted !== undefined ? { onlySoftDeleted: node.onlySoftDeleted } : {}),
+                        ...(node.forUpdate !== undefined ? { forUpdate: node.forUpdate } : {}),
                         relationName: rel.propertyName,
                     });
 
                     const instances = Model._mapRawList(TargetClass, raws, select);
 
                     for (const item of instances) {
-                        const parentId = String((item as any)[rel.foreignKey]);
+                        const parentId = String((item as any)[foreignKey]);
+                        if (!grouped.has(parentId)) grouped.set(parentId, []);
+                        grouped.get(parentId)!.push(item);
+                    }
+                }
+
+                for (const parent of parents) {
+                    const id = parent.id ? String(parent.id) : "";
+                    let items = grouped.get(id) ?? [];
+
+                    if (orderBy) items = Model._sortModelsInMemory(items, orderBy);
+
+                    if (items.length > 1) {
+                        throw new ORMError(
+                            "RelationIntegrityError",
+                            `OneToOne relation '${this.name}.${rel.propertyName}' has multiple rows for parent id '${id}'.`,
+                            409
+                        );
+                    }
+
+                    Model._assignLoadedRelation(parent, rel.propertyName, items[0] ?? null);
+                }
+
+                break;
+            }
+
+            case "OneToMany": {
+                if (!rel.foreignKey) return;
+                const foreignKey = rel.foreignKey;
+
+                const parentIds = Model._uniqueStrings(parents.map(parent => parent.id));
+                const grouped = new Map<string, Model[]>();
+                const select = Model._ensureSelect(node.select, [foreignKey]);
+
+                for (const id of parentIds) grouped.set(id, []);
+
+                for (const chunk of _chunk(parentIds, RELATION_ID_CHUNK_SIZE)) {
+                    const where = {
+                        ...(node.where ?? {}),
+                        [foreignKey]: { _isOperator: true, op: "in", val: chunk },
+                    };
+
+                    const raws = Model._queryAllRaw(TargetClass, where, {
+                        ...(orderBy ? { orderBy } : {}),
+                        ...(node.withSoftDeleted !== undefined ? { withSoftDeleted: node.withSoftDeleted } : {}),
+                        ...(node.onlySoftDeleted !== undefined ? { onlySoftDeleted: node.onlySoftDeleted } : {}),
+                        ...(node.forUpdate !== undefined ? { forUpdate: node.forUpdate } : {}),
+                        relationName: rel.propertyName,
+                    });
+
+                    const instances = Model._mapRawList(TargetClass, raws, select);
+
+                    for (const item of instances) {
+                        const parentId = String((item as any)[foreignKey]);
 
                         if (!grouped.has(parentId)) grouped.set(parentId, []);
                         grouped.get(parentId)!.push(item);
@@ -2144,8 +3329,9 @@ export class Model implements IModel {
                     };
 
                     const pivotRaws = Model._queryAllRaw(PivotClass, pivotWhere, {
-                        withSoftDeleted: node.withSoftDeleted,
-                        onlySoftDeleted: node.onlySoftDeleted,
+                        ...(node.withSoftDeleted !== undefined ? { withSoftDeleted: node.withSoftDeleted } : {}),
+                        ...(node.onlySoftDeleted !== undefined ? { onlySoftDeleted: node.onlySoftDeleted } : {}),
+                        ...(node.forUpdate !== undefined ? { forUpdate: node.forUpdate } : {}),
                         relationName: `${rel.propertyName}:pivot`,
                     });
 
@@ -2176,9 +3362,10 @@ export class Model implements IModel {
                     };
 
                     const targetRaws = Model._queryAllRaw(TargetClass, targetWhere, {
-                        orderBy,
-                        withSoftDeleted: node.withSoftDeleted,
-                        onlySoftDeleted: node.onlySoftDeleted,
+                        ...(orderBy ? { orderBy } : {}),
+                        ...(node.withSoftDeleted !== undefined ? { withSoftDeleted: node.withSoftDeleted } : {}),
+                        ...(node.onlySoftDeleted !== undefined ? { onlySoftDeleted: node.onlySoftDeleted } : {}),
+                        ...(node.forUpdate !== undefined ? { forUpdate: node.forUpdate } : {}),
                         relationName: rel.propertyName,
                     });
 
@@ -2252,11 +3439,11 @@ export class Model implements IModel {
             throw new ORMNotFoundError(ctor.name, String(relationName));
         }
 
-        const spec = {
+        const spec: Record<string, RelationNode<any> | true> = {
             [String(relationName)]: options ?? true,
-        } as RelationSpec<this>;
+        };
 
-        ctor._batchLoadRelations([this], spec as any);
+        ctor._batchLoadRelations([this], spec as RelationSpec<Model>);
 
         return this;
     }
@@ -2265,8 +3452,7 @@ export class Model implements IModel {
         const ctor = this.constructor as ModelClass<Model>;
         Model._ensureSchemaValidFor(ctor);
 
-
-        ctor._batchLoadRelations([this], spec as any);
+        ctor._batchLoadRelations([this], spec as unknown as RelationSpec<Model>);
 
         return this;
     }
@@ -2274,27 +3460,34 @@ export class Model implements IModel {
     static findOne<T extends Model>(
         this: ModelClass<T>,
         idOrWhere: string | WhereCondition<T>,
-        options?: { select?: any[]; withSoftDeleted?: boolean; onlySoftDeleted?: boolean }
+        options?: { select?: (keyof T)[]; withSoftDeleted?: boolean; onlySoftDeleted?: boolean, forUpdate?: boolean, }
     ): T | null {
-        Model._ensureSchemaValidFor(this as any);
+        Model._ensureSchemaValidFor(this);
 
-        if (typeof idOrWhere === "object" && _hasEmptyIn(idOrWhere as any)) return null;
+        if (typeof idOrWhere === "object" && _hasEmptyIn(idOrWhere)) return null;
 
         const obj = db.dynamicObject(this._tableName());
         const select = options?.select as string[] | undefined;
         let raw: any = null;
 
         if (typeof idOrWhere === "string") {
-            raw = obj.query(idOrWhere);
+            if (options?.forUpdate) {
+                const where = this._applySoftDeleteWhere({ id: idOrWhere }, options);
+                const cond = this._buildCondition(where);
+                const results = obj.queryByCondition(cond, { options: { limit: 1, forUpdate: true } });
+                raw = results?.[0] ?? null;
+            } else {
+                raw = obj.query(idOrWhere);
 
-            if (raw && !this._rawPassesSoftDelete(raw, options)) raw = null;
+                if (raw && !this._rawPassesSoftDelete(raw, options)) raw = null;
+            }
         } else {
             const where = this._applySoftDeleteWhere(idOrWhere as Record<string, any>, options);
             const cond = this._buildCondition(where);
 
             const results = cond.conditions.length > 0
-                ? obj.queryByCondition(cond, { options: { limit: 1 } })
-                : obj.queryByCondition({}, { options: { limit: 1 } });
+                ? obj.queryByCondition(cond, { options: { limit: 1, forUpdate: options?.forUpdate ?? false, } })
+                : obj.queryByCondition({}, { options: { limit: 1, forUpdate: options?.forUpdate ?? false } });
 
             raw = results?.[0] ?? null;
         }
@@ -2305,15 +3498,15 @@ export class Model implements IModel {
 
         this._resolveMLFields([instance], select);
 
-        return instance as any;
+        return instance;
     }
 
     static findOneOrFail<T extends Model>(
         this: ModelClass<T>,
         idOrWhere: string | WhereCondition<T>,
-        options?: { select?: any[]; withSoftDeleted?: boolean; onlySoftDeleted?: boolean }
+        options?: { select?: (keyof T)[]; withSoftDeleted?: boolean; onlySoftDeleted?: boolean, forUpdate?: boolean, }
     ): T {
-        Model._ensureSchemaValidFor(this as any);
+        Model._ensureSchemaValidFor(this);
         const result = this.findOne(idOrWhere, options);
 
         if (!result) {
@@ -2321,15 +3514,15 @@ export class Model implements IModel {
             throw new ORMNotFoundError(this.name, desc);
         }
 
-        return result as any;
+        return result;
     }
 
     static find<T extends Model>(
         this: ModelClass<T>,
-        options?: FindOptions<T, any>
+        options?: FindOptions<T, keyof T>
     ): T[] {
-        Model._ensureSchemaValidFor(this as any);
-        if (options?.where && _hasEmptyIn(options.where as any)) return [];
+        Model._ensureSchemaValidFor(this);
+        if (options?.where && _hasEmptyIn(options.where)) return [];
         if (options?.limit !== undefined && options.limit <= 0) return [];
 
         const obj = db.dynamicObject(this._tableName());
@@ -2361,7 +3554,9 @@ export class Model implements IModel {
 
         if (options?.offset !== undefined) queryOptions.skip = options.offset;
 
-        const where = this._applySoftDeleteWhere(options?.where as any, options);
+        if (options?.forUpdate !== undefined && options?.forUpdate === true) queryOptions.forUpdate = options.forUpdate;
+
+        const where = this._applySoftDeleteWhere(options?.where, options);
         const cond = this._buildCondition(where);
 
         const rawList = cond.conditions.length > 0
@@ -2372,19 +3567,19 @@ export class Model implements IModel {
 
         this._resolveMLFields(instances, select);
 
-        return instances as any;
+        return instances;
     }
 
     static findAndCount<T extends Model>(
         this: ModelClass<T>,
-        options?: FindOptions<T, any>
+        options?: FindOptions<T, keyof T>
     ): [T[], number] {
-        Model._ensureSchemaValidFor(this as any);
-        if (options?.where && _hasEmptyIn(options.where as any)) return [[], 0];
+        Model._ensureSchemaValidFor(this);
+        if (options?.where && _hasEmptyIn(options.where)) return [[], 0];
         if (options?.limit !== undefined && options.limit <= 0) return [[], 0];
 
         const data = this.find(options);
-        const where = this._applySoftDeleteWhere(options?.where as any, options);
+        const where = this._applySoftDeleteWhere(options?.where, options);
         const cond = this._buildCondition(where);
 
         const total = cond.conditions.length > 0
@@ -2396,10 +3591,10 @@ export class Model implements IModel {
 
     static findWithRelations<T extends Model>(
         this: ModelClass<T>,
-        options?: FindWithRelationsOptions<T, any>
+        options?: FindWithRelationsOptions<T, keyof T>
     ): T[] {
-        Model._ensureSchemaValidFor(this as any);
-        if (options?.where && _hasEmptyIn(options.where as any)) return [];
+        Model._ensureSchemaValidFor(this);
+        if (options?.where && _hasEmptyIn(options.where)) return [];
 
         const rows = this.find(options);
 
@@ -2414,9 +3609,9 @@ export class Model implements IModel {
         this: ModelClass<T>,
         idOrWhere: string | WhereCondition<T>,
         relations?: RelationSpec<T>,
-        options?: { select?: any[]; withSoftDeleted?: boolean; onlySoftDeleted?: boolean }
+        options?: { select?: (keyof T)[]; withSoftDeleted?: boolean; onlySoftDeleted?: boolean, forUpdate?: boolean, }
     ): T | null {
-        Model._ensureSchemaValidFor(this as any);
+        Model._ensureSchemaValidFor(this);
         const row = this.findOne(idOrWhere, options);
 
         if (!row) return null;
@@ -2432,9 +3627,9 @@ export class Model implements IModel {
         this: ModelClass<T>,
         idOrWhere: string | WhereCondition<T>,
         relations?: RelationSpec<T>,
-        options?: { select?: any[]; withSoftDeleted?: boolean; onlySoftDeleted?: boolean }
+        options?: { select?: (keyof T)[]; withSoftDeleted?: boolean; onlySoftDeleted?: boolean, forUpdate?: boolean, }
     ): T {
-        Model._ensureSchemaValidFor(this as any);
+        Model._ensureSchemaValidFor(this);
         const row = this.findOneOrFail(idOrWhere, options);
 
         if (relations) {
@@ -2446,9 +3641,9 @@ export class Model implements IModel {
 
     static findAndCountWithRelations<T extends Model>(
         this: ModelClass<T>,
-        options?: FindWithRelationsOptions<T, any>
+        options?: FindWithRelationsOptions<T, keyof T>
     ): [T[], number] {
-        Model._ensureSchemaValidFor(this as any);
+        Model._ensureSchemaValidFor(this);
         const [rows, total] = this.findAndCount(options);
 
         if (options?.relations && rows.length > 0) {
@@ -2461,12 +3656,18 @@ export class Model implements IModel {
     static count<T extends Model>(
         this: ModelClass<T>,
         where?: WhereCondition<T>,
-        options?: { withSoftDeleted?: boolean; onlySoftDeleted?: boolean }
+        options?: { withSoftDeleted?: boolean; onlySoftDeleted?: boolean; forUpdate?: boolean }
     ): number {
-        Model._ensureSchemaValidFor(this as any);
-        if (where && _hasEmptyIn(where as any)) return 0;
+        Model._ensureSchemaValidFor(this);
+        if (where && _hasEmptyIn(where)) return 0;
 
-        const finalWhere = this._applySoftDeleteWhere(where as any, options);
+        if (options?.forUpdate) {
+            throw new ORMValidationError({
+                forUpdate: "forUpdate is not supported for count().",
+            });
+        }
+
+        const finalWhere = this._applySoftDeleteWhere(where, options);
         const cond = this._buildCondition(finalWhere);
 
         if (cond.conditions.length === 0) {
@@ -2479,35 +3680,55 @@ export class Model implements IModel {
     static isExists<T extends Model>(
         this: ModelClass<T>,
         where: string | WhereCondition<T>,
-        options?: { withSoftDeleted?: boolean; onlySoftDeleted?: boolean }
+        options?: { withSoftDeleted?: boolean; onlySoftDeleted?: boolean; forUpdate?: boolean }
     ): boolean {
-        Model._ensureSchemaValidFor(this as any);
+        Model._ensureSchemaValidFor(this);
+
+        if (options?.forUpdate) {
+            throw new ORMValidationError({
+                forUpdate: "forUpdate is not supported for isExists().",
+            });
+        }
+
         if (typeof where === "string") return this.findOne(where, options) !== null;
-        if (where && typeof where === "object" && _hasEmptyIn(where as any)) return false;
+        if (where && typeof where === "object" && _hasEmptyIn(where)) return false;
 
         return this.count(where, options) > 0;
     }
 
     static batchInsert<T extends Model>(
         this: ModelClass<T>,
-        records: T[],
+        records: Array<T | ModelMutationData<T>>,
         _isRetry = false
-    ): void {
-        Model._ensureSchemaValidFor(this as any);
-        if (records.length === 0) return;
+    ): T[] {
+        Model._ensureSchemaValidFor(this);
+
+        if (records.length === 0) return [];
+
+        const modelRecords = records.map(record => this._toModelInstance(record as any));
 
         const obj = db.dynamicObject(this._tableName());
         const columns = this._columns();
 
-        for (const record of records) {
-            (record as any)._validate();
+        for (const record of modelRecords) {
+            (record as T)._validate();
         }
 
-        const plainRecords = records.map(record => (record as any)._buildInsertRecord(columns));
-        const firstKeys = Object.keys(plainRecords[0] ?? {}).sort().join(",");
-        const allSameShape = plainRecords.every(r => Object.keys(r).sort().join(",") === firstKeys);
+        const plainRecords = modelRecords.map(record =>
+            (record as any)._buildInsertRecord(columns)
+        );
+
+        const firstKeys = Object.keys(plainRecords[0] ?? {})
+            .sort()
+            .join(",");
+
+        const allSameShape = plainRecords.every(
+            r => Object.keys(r).sort().join(",") === firstKeys
+        );
+
         const flag = allSameShape ? { bulkImport: true } : undefined;
         const chunks = _chunk(plainRecords, BATCH_CHUNK_SIZE);
+
 
         let offset = 0;
 
@@ -2516,7 +3737,7 @@ export class Model implements IModel {
                 const ids = obj.batchInsert(chunk, flag) as string[];
 
                 for (let i = 0; i < chunk.length; i++) {
-                    const rec = records[offset + i] as any;
+                    const rec = modelRecords[offset + i] as any;
 
                     rec.id = ids[i];
                     rec.__isNew = false;
@@ -2526,8 +3747,10 @@ export class Model implements IModel {
 
                 offset += chunk.length;
             }
+
+            return modelRecords;
         } catch (err: any) {
-            const retry = (): void => this.batchInsert(records, true);
+            const retry = (): T[] => this.batchInsert(modelRecords, true);
 
             const result = _handleCaughtError(
                 err,
@@ -2536,17 +3759,42 @@ export class Model implements IModel {
                 () => this.handleDbError(err, this)
             );
 
-            return result as void;
+            return result as unknown as T[];
         }
     }
 
     static batchUpdate<T extends Model>(
         this: ModelClass<T>,
-        records: T[],
+        records: Array<T | ModelMutationData<T>>,
         _isRetry = false
     ): void {
-        Model._ensureSchemaValidFor(this as any);
+        Model._ensureSchemaValidFor(this);
         if (records.length === 0) return;
+
+        const modelRecords: T[] = records.map((record: T | ModelMutationData<T>) => {
+            if (record instanceof Model) {
+                return record as T;
+            }
+
+            const payload = record as Record<string, any>;
+            const id = payload.id;
+
+            if (!id) {
+                throw new ORMValidationError({
+                    id: "batchUpdate payload item must include id.",
+                });
+            }
+
+            const row = this.findOneOrFail(String(id), { withSoftDeleted: true });
+
+            const applyDataOptions: ApplyDataOptions = {
+                relationMode: "none",
+            };
+
+            Model._applyData(row, record as ModelMutationData<T>, applyDataOptions);
+
+            return row;
+        });
 
         const obj = db.dynamicObject(this._tableName());
         const columns = this._columns();
@@ -2554,7 +3802,7 @@ export class Model implements IModel {
         const colMap: Record<string, string> = {};
         for (const col of columns) colMap[col.propertyName] = col.columnName;
 
-        const dirtyRecords = records.filter(r => r.__dirtyFields.size > 0);
+        const dirtyRecords = modelRecords.filter(r => r.__dirtyFields.size > 0);
 
         if (dirtyRecords.length === 0) return;
 
@@ -2587,7 +3835,11 @@ export class Model implements IModel {
 
                 let val = self[field];
 
-                if ((colMeta?.type === "date" || colMeta?.type === "datetime") && val !== null && val !== undefined) {
+                if (colMeta?.type === "date" && val !== null && val !== undefined) {
+                    val = toDateOnlyString(val);
+                }
+
+                if (colMeta?.type === "datetime" && val !== null && val !== undefined) {
                     val = toUtcISOString(val);
                 }
 
@@ -2608,7 +3860,7 @@ export class Model implements IModel {
                 obj.batchUpdate(chunk);
             }
         } catch (err: any) {
-            const retry = (): void => this.batchUpdate(records, true);
+            const retry = (): void => this.batchUpdate(modelRecords, true);
 
             const result = _handleCaughtError(
                 err,
@@ -2632,7 +3884,7 @@ export class Model implements IModel {
         options?: DeleteOptions<T>,
         _isRetry = false
     ): void {
-        Model._ensureSchemaValidFor(this as any);
+        Model._ensureSchemaValidFor(this);
         if (records.length === 0) return;
 
         if (this._deletedAtColumn()) {
@@ -2665,7 +3917,7 @@ export class Model implements IModel {
         options?: DeleteOptions<T>,
         _isRetry = false
     ): void {
-        Model._ensureSchemaValidFor(this as any);
+        Model._ensureSchemaValidFor(this);
         if (records.length === 0) return;
 
         const tableName = this._tableName();
